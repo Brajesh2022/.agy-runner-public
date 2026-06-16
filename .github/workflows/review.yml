@@ -1,0 +1,603 @@
+name: AGY PR Review
+run-name: "Review PR #${{ github.event.client_payload.pr_number }}: ${{ github.event.client_payload.pr_title }} (${{ github.event.client_payload.repo }})"
+on:
+  repository_dispatch:
+    types: [review]
+
+concurrency:
+  group: agy-pr-${{ github.event.client_payload.repo }}-${{ github.event.client_payload.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout runner repo (for agy defaults)
+        if: ${{ contains(github.repository, '.agy-runner') || contains(github.repository, 'agy-code-reviewer') }}
+        uses: actions/checkout@v4
+        with:
+          token: ${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Checkout central runner repo (for agy defaults)
+        if: ${{ !contains(github.repository, '.agy-runner') && !contains(github.repository, 'agy-code-reviewer') }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/.agy-runner
+          token: ${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Mask GitHub Token
+        run: echo "::add-mask::${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}"
+
+      - name: Get current date for cache
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Cache Antigravity CLI
+        id: cache-agy
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/agy
+          key: agy-cli-linux-${{ steps.date.outputs.date }}
+
+      - name: Install agy
+        if: steps.cache-agy.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL https://antigravity.google/cli/install.sh | bash
+          
+      - name: Add agy to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Setup gh CLI
+        run: echo "${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+
+      - name: Configure Global Git Identity & Auth
+        run: |
+          GIT_USER_NAME=$(jq -r '.git_user_name // "${{ github.actor }}"' ./agy-defaults/settings.json 2>/dev/null || echo "${{ github.actor }}")
+          GIT_USER_EMAIL=$(jq -r '.git_user_email // "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"' ./agy-defaults/settings.json 2>/dev/null || echo "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com")
+          git config --global user.name "$GIT_USER_NAME"
+          git config --global user.email "$GIT_USER_EMAIL"
+          git config --global url."https://x-access-token:${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+          # Set up global Co-Author hook if requested
+          CO_AUTHOR_NAME=$(jq -r '.git_co_author_name // empty' ./agy-defaults/settings.json 2>/dev/null || true)
+          CO_AUTHOR_EMAIL=$(jq -r '.git_co_author_email // empty' ./agy-defaults/settings.json 2>/dev/null || true)
+          if [ -n "$CO_AUTHOR_NAME" ] && [ -n "$CO_AUTHOR_EMAIL" ]; then
+            echo "Setting up global Co-Author hook for $CO_AUTHOR_NAME..."
+            mkdir -p ~/.githooks
+            echo '#!/bin/bash' > ~/.githooks/prepare-commit-msg
+            echo 'echo "" >> "$1"' >> ~/.githooks/prepare-commit-msg
+            echo 'echo "Co-authored-by: placeholder" >> "$1"' >> ~/.githooks/prepare-commit-msg
+            sed -i "s|placeholder|${CO_AUTHOR_NAME} <${CO_AUTHOR_EMAIL}>|" ~/.githooks/prepare-commit-msg
+            chmod +x ~/.githooks/prepare-commit-msg
+            git config --global core.hooksPath ~/.githooks
+          fi
+
+      - name: Restore Agent Workspace Cache
+        id: workspace-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Agent-Workspace
+          key: agent-workspace-pr-${{ github.event.client_payload.repo }}-${{ github.event.client_payload.pr_number }}-${{ github.run_id }}
+          restore-keys: |
+            agent-workspace-pr-${{ github.event.client_payload.repo }}-${{ github.event.client_payload.pr_number }}-
+
+      - name: Create Workspace if missing
+        run: mkdir -p ~/Agent-Workspace
+
+      - name: Restore agy auth
+        run: |
+          mkdir -p ~/.gemini/antigravity-cli/cache
+          cp ./agy-defaults/settings.json ~/.gemini/antigravity-cli/ 2>/dev/null || true
+          cp ./agy-defaults/keybindings.json ~/.gemini/antigravity-cli/ 2>/dev/null || true
+          cp ./agy-defaults/cache/onboarding.json ~/.gemini/antigravity-cli/cache/ 2>/dev/null || true
+          echo '${{ secrets.AGY_OAUTH_TOKEN }}' > ~/.gemini/antigravity-cli/antigravity-oauth-token
+          cp ./agy-defaults/installation_id ~/.gemini/antigravity-cli/ 2>/dev/null || true
+
+      - name: Setup AGENTS.md and Skills
+        run: |
+          mkdir -p ~/.gemini
+          cp ./agy-defaults/review_agents.md ~/.gemini/AGENTS.md 2>/dev/null || true
+          cp ./agy-defaults/review_agents.md ~/AGENTS.md 2>/dev/null || true
+          cp ./agy-defaults/review_agents.md ~/Agent-Workspace/AGENTS.md 2>/dev/null || true
+          if [ -d "./skills" ]; then
+            cp -r ./skills ~/.gemini/antigravity-cli/skills
+          fi
+
+      - name: Sparse-checkout memory branch
+        run: |
+          REPO_ID=$(gh api repos/${{ github.event.client_payload.repo }} --jq .id)
+          echo "REPO_ID=$REPO_ID" >> $GITHUB_ENV
+          PR_NUMBER=${{ github.event.client_payload.pr_number }}
+          
+          mkdir agy-memory
+          cd agy-memory
+          git init
+          RUNNER_REPO="${{ github.repository }}"
+          if [[ ! "$RUNNER_REPO" == *".agy-runner"* && ! "$RUNNER_REPO" == *"agy-code-reviewer"* ]]; then
+            RUNNER_REPO="${{ github.repository_owner }}/.agy-runner"
+          fi
+          git remote add origin https://x-access-token:${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}@github.com/${RUNNER_REPO}.git
+          
+          if git ls-remote --exit-code --heads origin agy-memory; then
+            git fetch --depth 1 --filter=blob:none origin agy-memory
+            git sparse-checkout set "repo-${REPO_ID}/pr-${PR_NUMBER}/"
+            git checkout agy-memory
+          else
+            git checkout --orphan agy-memory
+            git rm -rf . || true
+          fi
+          
+          if [ -d "repo-${REPO_ID}/pr-${PR_NUMBER}" ]; then
+            echo "MEMORY_EXISTS=true" >> $GITHUB_ENV
+            mkdir -p ~/.gemini
+            if [ -f "repo-${REPO_ID}/pr-${PR_NUMBER}/memory.tar.gz" ]; then
+              mkdir -p ~/.gemini/antigravity-cli
+              tar -xzf repo-${REPO_ID}/pr-${PR_NUMBER}/memory.tar.gz -C ~/.gemini/antigravity-cli/ || true
+            fi
+            if [ -d "repo-${REPO_ID}/pr-${PR_NUMBER}/antigravity-cli" ]; then
+              cp -r "repo-${REPO_ID}/pr-${PR_NUMBER}/antigravity-cli" ~/.gemini/
+            fi
+            if [ -f "repo-${REPO_ID}/pr-${PR_NUMBER}/conversation_id.txt" ]; then
+              cat "repo-${REPO_ID}/pr-${PR_NUMBER}/conversation_id.txt" | { read id; echo "AGY_CONVERSATION_ID=$id" >> $GITHUB_ENV; }
+            fi
+            if [ -f "repo-${REPO_ID}/pr-${PR_NUMBER}/latest_commit.txt" ]; then
+              cp "repo-${REPO_ID}/pr-${PR_NUMBER}/latest_commit.txt" ~/.gemini/latest_commit.txt
+            fi
+            
+            if [ -d "repo-${REPO_ID}/pr-${PR_NUMBER}/attachments" ]; then
+              mkdir -p ~/Agent-Workspace/attachments
+              mv repo-${REPO_ID}/pr-${PR_NUMBER}/attachments/* ~/Agent-Workspace/attachments/ 2>/dev/null || true
+              rm -rf "repo-${REPO_ID}/pr-${PR_NUMBER}/attachments"
+            fi
+            
+            mkdir -p ~/.gemini/antigravity-cli/cache
+            echo '${{ secrets.AGY_OAUTH_TOKEN }}' > ~/.gemini/antigravity-cli/antigravity-oauth-token
+            cp ../agy-defaults/settings.json ~/.gemini/antigravity-cli/ 2>/dev/null || true
+            cp ../agy-defaults/keybindings.json ~/.gemini/antigravity-cli/ 2>/dev/null || true
+            cp ../agy-defaults/cache/onboarding.json ~/.gemini/antigravity-cli/cache/ 2>/dev/null || true
+            cp ../agy-defaults/installation_id ~/.gemini/antigravity-cli/ 2>/dev/null || true
+            cp ../agy-defaults/review_agents.md ~/.gemini/AGENTS.md 2>/dev/null || true
+            cp ../agy-defaults/review_agents.md ~/AGENTS.md 2>/dev/null || true
+          else
+            echo "MEMORY_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Calculate Incremental Diff
+        id: diff
+        run: |
+          CURRENT_SHA=$(gh pr view ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} --json headRefOid -q .headRefOid)
+          echo "CURRENT_SHA=$CURRENT_SHA" >> $GITHUB_ENV
+          DIFF_PATH=""
+          INCREMENTAL_DIFF=false
+          NEW_COMMITS=false
+          
+          if [ "$MEMORY_EXISTS" = "true" ] && [ -f ~/.gemini/latest_commit.txt ]; then
+            LAST_SHA=$(cat ~/.gemini/latest_commit.txt)
+            if [ "$CURRENT_SHA" != "$LAST_SHA" ]; then
+              echo "New commits detected. Getting incremental diff..."
+              gh api repos/${{ github.event.client_payload.repo }}/compare/${LAST_SHA}...${CURRENT_SHA} -H "Accept: application/vnd.github.v3.diff" > /tmp/pr.diff || true
+              DIFF_PATH="/tmp/pr.diff"
+              INCREMENTAL_DIFF=true
+              NEW_COMMITS=true
+            else
+              echo "No new commits."
+              gh pr diff ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} > /tmp/pr.diff || true
+              DIFF_PATH="/tmp/pr.diff"
+            fi
+          else
+            echo "First run or no saved commit. Getting full PR diff..."
+            gh pr diff ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} > /tmp/pr.diff || true
+            DIFF_PATH="/tmp/pr.diff"
+            NEW_COMMITS=true
+          fi
+          
+          echo "DIFF_PATH=$DIFF_PATH" >> $GITHUB_ENV
+          echo "INCREMENTAL_DIFF=$INCREMENTAL_DIFF" >> $GITHUB_ENV
+          echo "NEW_COMMITS=$NEW_COMMITS" >> $GITHUB_ENV
+
+      - name: Clone Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.client_payload.repo }}
+          ref: ${{ env.CURRENT_SHA }}
+          path: target-repo
+          token: ${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          
+      - name: Move cloned repo to tmp
+        run: mv target-repo /tmp/target-repo
+
+      - name: Build Task Prompt
+        uses: actions/github-script@v7
+        env:
+          APP_SLUG: ${{ github.event.client_payload.reply_info.comment_author || github.actor }}
+          EVENT_TYPE: ${{ github.event.client_payload.event_type }}
+          CUSTOM_INSTR: ${{ github.event.client_payload.custom_instructions }}
+          IN_REPLY_TO_ID: ${{ github.event.client_payload.reply_info.in_reply_to_id }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          REPO: ${{ github.event.client_payload.repo }}
+          MEMORY_EXISTS: ${{ env.MEMORY_EXISTS }}
+          WORKSPACE_CACHE_KEY: ${{ steps.workspace-cache.outputs.cache-matched-key }}
+          DIFF_PATH: ${{ env.DIFF_PATH }}
+          INCREMENTAL_DIFF: ${{ env.INCREMENTAL_DIFF }}
+          NEW_COMMITS: ${{ env.NEW_COMMITS }}
+          CURRENT_SHA: ${{ env.CURRENT_SHA }}
+        with:
+          github-token: ${{ github.event.client_payload.gh_token || secrets.GH_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const eventType = process.env.EVENT_TYPE || 'review';
+            const customInstr = process.env.CUSTOM_INSTR;
+            const inReplyToId = process.env.IN_REPLY_TO_ID;
+            const prNumber = parseInt(process.env.PR_NUMBER);
+            const repo = process.env.REPO;
+            const memoryExists = process.env.MEMORY_EXISTS === 'true';
+            const workspaceCacheHit = (process.env.WORKSPACE_CACHE_KEY || '').trim() !== '';
+            const newCommits = process.env.NEW_COMMITS === 'true';
+            const diffPath = process.env.DIFF_PATH;
+            const incrementalDiff = process.env.INCREMENTAL_DIFF === 'true';
+            const appSlug = process.env.APP_SLUG;
+            const currentSha = process.env.CURRENT_SHA;
+            
+            let systemContext = "<SYSTEM_CONTEXT>\n";
+            
+            if (memoryExists && !workspaceCacheHit) {
+              systemContext += "⚠️ WARNING: Your persistent ~/Agent-Workspace was automatically deleted because it exceeded the 7-day inactivity limit. Any files, custom scripts, or cloned repositories you previously saved there are gone. You must recreate or re-clone them if you need them.\n\n";
+            }
+            
+            systemContext += `You are processing PR #${prNumber} in ${repo}.\n`;
+            systemContext += `- The repository has been pre-cloned for you at \`/tmp/target-repo\`.\n`;
+            if (memoryExists) {
+              systemContext += `  *(Suggestion: You may copy this repo to \`~/Agent-Workspace\` if you are making ongoing changes. \`/tmp\` resets on every run, while your workspace persists for a week. If new commits are pushed by the user later, the updated repo will automatically be re-cloned into \`/tmp/target-repo\` and you will be notified.)*\n`;
+            }
+            
+            if (newCommits) {
+              if (incrementalDiff) {
+                systemContext += `- New commits were pushed since your last run. An incremental diff showing ONLY the recent changes is available at \`${diffPath}\`.\n`;
+              } else {
+                systemContext += `- The full PR diff is available at \`${diffPath}\`.\n`;
+              }
+            } else {
+              systemContext += `- No new commits were pushed since your last run. The full PR diff is available at \`${diffPath}\`.\n`;
+            }
+            
+            if (!memoryExists) {
+              systemContext += `- You are operating in an ephemeral GitHub Action. Any files you create outside of ~/Agent-Workspace will be lost.\n`;
+            }
+            
+
+            if (inReplyToId && inReplyToId !== 'null' && inReplyToId !== '') {
+               try {
+                   const commentId = parseInt(inReplyToId);
+                   const owner = repo.split('/')[0];
+                   const repoName = repo.split('/')[1];
+                   const { data: comment } = await github.rest.pulls.getReviewComment({
+                       owner: owner,
+                       repo: repoName,
+                       comment_id: commentId
+                   });
+                   
+                   const query = `
+                     query($owner: String!, $repo: String!, $pr: Int!) {
+                       repository(owner: $owner, name: $repo) {
+                         pullRequest(number: $pr) {
+                           reviewThreads(first: 50) {
+                             nodes {
+                               isOutdated
+                               isResolved
+                               comments(first: 100) {
+                                 nodes {
+                                   databaseId
+                                 }
+                               }
+                             }
+                           }
+                         }
+                       }
+                     }`;
+                   const gqlResult = await github.graphql(query, {
+                       owner: owner,
+                       repo: repoName,
+                       pr: prNumber
+                   });
+                   
+                   let isOutdated = false;
+                   let isResolved = false;
+                   const threads = gqlResult.repository.pullRequest.reviewThreads.nodes;
+                   for (const thread of threads) {
+                     for (const c of thread.comments.nodes) {
+                       if (c.databaseId === commentId) {
+                         isOutdated = thread.isOutdated;
+                         isResolved = thread.isResolved;
+                         break;
+                       }
+                     }
+                   }
+                   
+                   const isOlderCommit = comment.commit_id !== currentSha;
+                   let statusStr = '✅ Active';
+                   if (isResolved) {
+                     statusStr = '✅ Resolved (The conversation has been marked as resolved)';
+                   } else if (isOutdated) {
+                     statusStr = '⚠️ Outdated (The specific lines of code this comment refers to have been modified by newer commits)';
+                   } else if (isOlderCommit) {
+                     statusStr = 'ℹ️ Active (Note: Comment was made on an older commit, but these specific lines have not changed)';
+                   }
+                   
+                   systemContext += `\n### Thread Context\n`;
+                   systemContext += `The user is replying to an inline code review comment.\n`;
+                   systemContext += `**Status:** ${statusStr}\n`;
+                   systemContext += `**Comment ID:** \`${commentId}\` (Use this ID in your API call to reply to the thread)\n`;
+                   systemContext += `**File:** ${comment.path} (Line ${comment.line || comment.original_line})\n`;
+                   systemContext += `**Diff Hunk:**\n\`\`\`diff\n${comment.diff_hunk}\n\`\`\`\n`;
+                   systemContext += `**Original Comment:**\n${comment.body}\n`;
+               } catch (e) {
+                   systemContext += `\n(This is a reply to an inline comment, but the context could not be fetched: ${e.message})\n`;
+               }
+            }
+            systemContext += "</SYSTEM_CONTEXT>\n";
+            
+            let taskPrompt = systemContext;
+            
+            if (eventType === 'review' && !memoryExists) {
+               let settings = {};
+               try {
+                 const settingsRaw = fs.readFileSync('./agy-defaults/settings.json', 'utf8');
+                 settings = JSON.parse(settingsRaw);
+               } catch(e){}
+               
+               if (settings.post_pr_summary || settings.update_pr_title) {
+                 taskPrompt += `\n---\n## Additional Tasks (First Review Only)\n`;
+                 if (settings.post_pr_summary) {
+                   taskPrompt += `\n### Task: PR Summary\nPlease post a completely NEW, separate PR issue comment summarizing the changes in plain English. Use the \`gh pr comment\` command to post this summary.\n`;
+                 }
+                 if (settings.update_pr_title) {
+                   taskPrompt += `\n### Task: Polish PR Title & Description\nPlease rewrite and improve the PR title and description based on the actual code changes. Use the \`gh pr edit\` command to apply your improvements.\n`;
+                 }
+               }
+            }
+            
+            taskPrompt += `\n<USER_MESSAGE>\n`;
+            if (eventType === 'review') {
+              taskPrompt += `**User (@${appSlug}) requested a full PR review.**\nPlease perform a thorough review of the PR diff.\n`;
+            } else if (eventType === 'summary') {
+              taskPrompt += `**User (@${appSlug}) requested a PR summary.**\nPlease generate a summary of the PR.\n`;
+            } else if (eventType === 'polish') {
+              taskPrompt += `**User (@${appSlug}) requested to polish the PR.**\nPlease polish the PR title and description using \`gh pr edit\`.\n`;
+            } else if (eventType === 'inline_reply') {
+              taskPrompt += `**User (@${appSlug}) replied to an inline code review comment.**\nPlease review the thread context and address their comment.\n`;
+            } else {
+              taskPrompt += `**User (@${appSlug}) sent a message.**\nPlease review the PR context and assist with the request.\n`;
+            }
+            
+            if (customInstr) {
+              taskPrompt += `\n**Additional Directive:**\n${customInstr}\n`;
+            }
+            taskPrompt += `</USER_MESSAGE>\n`;
+            
+            fs.writeFileSync('task-prompt.txt', taskPrompt);
+
+      - name: Hide memory directory
+        run: mv agy-memory ../agy-memory-stash || true
+
+      - name: Persist All Tooling and Packages
+        run: |
+          # 1. Restore any previously backed up catch-all dotfiles from the workspace
+          if [ -d ~/Agent-Workspace/.home-backup ]; then
+            rsync -a ~/Agent-Workspace/.home-backup/ ~/ || true
+          fi
+
+          # 2. Create the standard hidden directories inside the persistent workspace
+          mkdir -p ~/Agent-Workspace/{.local,.npm,.cache,.config,.agent-browser,.npm-global,.cargo,.rustup,.bun,.nvm,.pyenv}
+          
+          # 3. Symlink the runner's home directories to point to the workspace
+          for dir in .local .npm .cache .config .agent-browser .cargo .rustup .bun .nvm .pyenv; do
+            if [ -d ~/$dir ] && [ ! -L ~/$dir ]; then
+              rsync -a ~/$dir/ ~/Agent-Workspace/$dir/ 2>/dev/null || true
+              rm -rf ~/$dir
+            fi
+            ln -sfn ~/Agent-Workspace/$dir ~/$dir
+          done
+          
+          # 4. Tell npm to install "global" packages inside the workspace
+          npm config set prefix '~/Agent-Workspace/.npm-global'
+          
+          # 5. Make sure the newly installed commands are available in the PATH
+          echo "$HOME/Agent-Workspace/.npm-global/bin" >> $GITHUB_PATH
+          echo "$HOME/Agent-Workspace/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/Agent-Workspace/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/Agent-Workspace/.bun/bin" >> $GITHUB_PATH
+
+      - name: Run agy
+        run: |
+          cd ~/Agent-Workspace
+
+          cat $GITHUB_WORKSPACE/task-prompt.txt > /tmp/task.txt
+          echo "REVIEW_COMPLETE_AGY_2026" >> /tmp/task.txt
+
+          # Start watchdog in background
+          node $GITHUB_WORKSPACE/agy-defaults/watchdog.js &
+          WATCHDOG_PID=$!
+
+          touch /tmp/agy_stderr.log
+
+          cat << 'EOF' > /tmp/run_agy.sh
+          #!/bin/bash
+          export AGY_RESTART_COUNT=0
+          while [ $AGY_RESTART_COUNT -lt 5 ]; do
+            if [ "$MEMORY_EXISTS" = "true" ] && [ -n "$AGY_CONVERSATION_ID" ]; then
+              cat /tmp/task.txt | agy --print-timeout 360m --conversation "$AGY_CONVERSATION_ID"
+            else
+              cat /tmp/task.txt | agy --print-timeout 360m
+            fi
+            
+            NEW_ID=$(ls -t ~/.gemini/antigravity-cli/conversations/*.db 2>/dev/null | head -n 1 | xargs -r basename -s .db || true)
+            if [ -n "$NEW_ID" ]; then
+              export AGY_CONVERSATION_ID="$NEW_ID"
+              export MEMORY_EXISTS="true"
+            fi
+            
+            if [ -f /tmp/agy_force_restart ]; then
+              echo "Watchdog triggered restart..."
+              rm -f /tmp/agy_force_restart
+              AGY_RESTART_COUNT=$((AGY_RESTART_COUNT+1))
+            else
+              break
+            fi
+          done
+          EOF
+          chmod +x /tmp/run_agy.sh
+
+          if [ "$MEMORY_EXISTS" = "true" ] && [ -n "$AGY_CONVERSATION_ID" ]; then
+            echo "Resuming conversation: $AGY_CONVERSATION_ID"
+          else
+            echo "Starting new conversation"
+          fi
+
+          script -e -q -c "/tmp/run_agy.sh" /tmp/agy_output.log || true
+
+          # Signal background scripts to finish and wait for them
+          touch /tmp/agy_finished
+          wait $WATCHDOG_PID || true
+
+          NEW_ID=$(ls -t ~/.gemini/antigravity-cli/conversations/*.db 2>/dev/null | head -n 1 | xargs -r basename -s .db || true)
+          if [ -n "$NEW_ID" ]; then
+            echo "SAVED_CONVERSATION_ID=$NEW_ID" >> $GITHUB_ENV
+          fi
+
+          cat /tmp/agy_output.log
+          echo "--- STDERR ---"
+          cat /tmp/agy_stderr.log
+
+          cat /tmp/agy_output.log /tmp/agy_stderr.log > /tmp/agy_combined.log
+          LATEST_CLI_LOG=$(ls -t ~/.gemini/antigravity-cli/log/cli-*.log 2>/dev/null | head -n 1)
+          if [ -n "$LATEST_CLI_LOG" ]; then
+            cat "$LATEST_CLI_LOG" >> /tmp/agy_combined.log
+          fi
+
+          if grep -qi "Authentication required" /tmp/agy_combined.log; then
+            echo "auth_failed=true" >> $GITHUB_ENV
+          fi
+
+          if grep -qiE "quota reached|quota exceeded|rate limit|RESOURCE_EXHAUSTED" /tmp/agy_combined.log; then
+            echo "quota_reached=true" >> $GITHUB_ENV
+          fi
+
+      - name: Save memory
+        if: always()
+        run: |
+          mv ../agy-memory-stash agy-memory || true
+          cd agy-memory
+
+          if [ -d ~/.gemini/antigravity-cli ]; then
+            git rm -rf repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/memory.tar.gz 2>/dev/null || true
+
+            rm -f ~/.gemini/antigravity-cli/antigravity-oauth-token
+            rm -f ~/.gemini/antigravity-cli/settings.json
+            rm -f ~/.gemini/antigravity-cli/keybindings.json
+            rm -f ~/.gemini/antigravity-cli/installation_id
+            rm -rf ~/.gemini/antigravity-cli/cache ~/.gemini/antigravity-cli/skills
+
+            rm -rf repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/antigravity-cli
+
+            mkdir -p repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}
+            cp -r ~/.gemini/antigravity-cli repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/
+            rm -rf repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/antigravity-cli/bin
+
+            if [ -z "$SAVED_CONVERSATION_ID" ]; then
+              SAVED_CONVERSATION_ID=$(ls -t ~/.gemini/antigravity-cli/conversations/*.db 2>/dev/null | head -n 1 | xargs -r basename -s .db || true)
+            fi
+            if [ -n "$SAVED_CONVERSATION_ID" ]; then
+              echo "$SAVED_CONVERSATION_ID" > repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/conversation_id.txt
+            fi
+            
+            # Save the CURRENT_SHA so we know exactly what was reviewed during this run
+            if [ -n "$CURRENT_SHA" ]; then
+              echo "$CURRENT_SHA" > ~/.gemini/latest_commit.txt
+              cp ~/.gemini/latest_commit.txt repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}/latest_commit.txt
+            fi
+          fi
+
+          git add repo-${{ env.REPO_ID }}/pr-${{ github.event.client_payload.pr_number }}
+
+          if git diff --staged --quiet; then
+            echo "No memory changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update memory for PR #${{ github.event.client_payload.pr_number }}"
+
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if git push origin agy-memory; then
+              break
+            fi
+            echo "Push failed, rebasing..."
+            sleep $((1 + RANDOM % 5))
+            git pull --rebase origin agy-memory
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "Failed to push memory after $MAX_RETRIES retries."
+            exit 1
+          fi
+
+      - name: Post Failure Comment
+        if: failure() || env.auth_failed == 'true' || env.quota_reached == 'true'
+        run: |
+          if [ "$auth_failed" = "true" ]; then
+            gh pr comment ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} \
+              --body "❌ **Antigravity Code Review Failed.** Your AI token has expired or is corrupted. Please [re-authenticate here](${{ github.event.client_payload.platform_origin }}/setup.html#oauth) to continue using the bot."
+          elif [ "$quota_reached" = "true" ]; then
+            gh pr comment ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} \
+              --body "⚠️ **Model Quota Reached.** The current AI model's individual quota has been exceeded. You can switch to a different model in your [setup page](${{ github.event.client_payload.platform_origin }}/setup.html) and try again."
+          else
+            gh pr comment ${{ github.event.client_payload.pr_number }} --repo ${{ github.event.client_payload.repo }} \
+              --body "❌ **Antigravity Code Review Failed.** The agent encountered an unexpected error. Please check the GitHub Action logs."
+          fi
+          exit 1
+
+      - name: Backup Catch-all Packages
+        if: always()
+        run: |
+          mkdir -p ~/Agent-Workspace/.home-backup
+          rsync -a --exclude='.gemini' --exclude='.github' --exclude='.ssh' --exclude='Agent-Workspace' --exclude='.local/bin/agy' ~/.[^.]* ~/Agent-Workspace/.home-backup/ || true
+
+      - name: Save Agent Workspace Cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/Agent-Workspace
+          key: agent-workspace-pr-${{ github.event.client_payload.repo }}-${{ github.event.client_payload.pr_number }}-${{ github.run_id }}
+
+      - name: Update Limits and Usages
+        if: always()
+        run: |
+          echo "Fetching Antigravity usage limits..."
+          mkdir -p ~/.gemini/antigravity-cli
+          echo '${{ secrets.AGY_OAUTH_TOKEN }}' > ~/.gemini/antigravity-cli/antigravity-oauth-token
+
+          python3 ./agy-defaults/get_usages.py || echo "Failed to fetch usages"
+          git add ./agy-defaults/settings.json
+          git commit -m "chore: update usages and limits [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin main || true
+          git push origin HEAD || echo "Failed to push usages"
+
+      - name: Auto-Update Runner Repo
+        if: always()
+        run: |
+          AUTO_UPDATE_SETTING=$(jq -r '.auto_update' ./agy-defaults/settings.json 2>/dev/null || echo "true")
+          if [ "$AUTO_UPDATE_SETTING" = "false" ]; then
+            echo "Auto-update is disabled in settings. Skipping update."
+            exit 0
+          fi
+          LATEST_VERSION="${{ github.event.client_payload.latest_version }}"
+          CURRENT_VERSION=$(cat ./agy-defaults/version.txt 2>/dev/null || echo "0")
+          if [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" -gt "$CURRENT_VERSION" ]; then
+            echo "Updating runner from version $CURRENT_VERSION to $LATEST_VERSION..."
+            curl -s -X POST "${{ github.event.client_payload.platform_origin }}/provision" \
+              -H "Content-Type: application/json" \
+              -d "{\"update_only\": true, \"owner\": \"${{ github.repository_owner }}\", \"installation_id\": \"${{ github.event.client_payload.installation_id }}\"}"
+          fi
